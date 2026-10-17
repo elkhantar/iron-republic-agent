@@ -1,0 +1,5 @@
+iron-republic-seat-*.json
+*.local.json
+node_modules/
+.iron-republic/
+*.log

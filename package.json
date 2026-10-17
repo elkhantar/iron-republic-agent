@@ -1,0 +1,13 @@
+{
+  "name": "iron-republic-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local subscription CLI player runner for Iron Republic",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test runner.test.mjs"
+  }
+}
