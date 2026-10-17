@@ -18,7 +18,7 @@ rules text, card data, artwork, game-engine code, bot logic or credentials.
 5. The CLI returns a move. The runner checks it is currently legal, then submits
    it with the seat token. The server also checks turn, decision and revision.
 
-The model is not given the seat token. `IR_SEAT_TOKEN` is removed from the child
+The runner does not put the seat token in model prompts. `IR_SEAT_TOKEN` is removed from the child
 process environment. The runner does not read your CLI's authentication files,
 copy provider credentials, contact a runner telemetry service, or configure a
 remote agent service. Your chosen CLI can have its own logging, telemetry,
@@ -28,18 +28,35 @@ plugins, authentication and retention behavior; those are outside this runner.
 
 Prompts are piped to native processes with `shell: false`, in an isolated
 temporary working directory. Claude's built-in tools and MCP configuration are
-disabled for the invocation; OpenCode receives deny permissions; Codex uses its
-read-only sandbox. Other CLI settings and credentials are inherited from your
+disabled for the invocation, with safe mode and user hooks disabled (managed
+hooks can still run); OpenCode disables external plugins with `--pure` and
+receives deny permissions; Codex ignores
+user configuration and project rules, disables its shell tool and uses its
+read-only sandbox. Gemini gets temporary project settings disabling built-in
+tools, hooks, MCP, extensions and skills; genuine managed system settings retain
+their normal precedence. Other CLI settings and credentials are inherited from your
 own account. This is **not** a universal sandbox for arbitrary executables. A
 custom command is software you choose to trust. No dangerous blanket approval
-or sandbox-bypass option is enabled by the runner.
+or sandbox-bypass option is enabled by the runner. Tool restrictions are defense
+in depth, not an operating-system security boundary: a trusted CLI or plugin can
+still access files and inherited provider credentials under your account. Keep
+connection files outside any shared agent project, and use only trusted CLIs and
+local configuration. The runner cannot sanitize arbitrary malicious software.
 
 Only one legal action is requested at a time, with no model calls while waiting
 for another seat. Invalid output stops after bounded retries. A timeout ends a
-stalled CLI. Ctrl+C stops the runner. A local journal stores a pending action,
+stalled CLI and attempts to terminate its process tree. It stops waiting even
+if OS cleanup fails; detached or orphaned processes are not a universal billing
+or isolation guarantee. Ctrl+C stops the runner. CLI stderr is not
+printed automatically because it can contain private data. A local journal stores a pending action,
 revision, decision ID and request ID so a restart can safely retry an uncertain
 submission. It does not store the token or entire game view. A CLI may separately
-retain prompts in its own history; check that CLI's settings.
+retain prompts in its own history; check that CLI's settings. The journal records
+a one-way connection fingerprint to catch accidental reuse with a different
+seat. Legacy journals without that fingerprint must be used with their original
+connection. Unknown submission errors retain the pending request; only confirmed
+invalid/conflicting actions clear it. Transient reads have bounded retries, and
+repeated decisions stop instead of repeatedly spending model calls.
 
 ## Keep private
 

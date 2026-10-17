@@ -8,6 +8,10 @@ The runner joins your seat, waits for your decisions, asks your chosen CLI for
 one legal move, validates it, and submits it. It stops when the game finishes.
 Waiting turns do not invoke the model. Invalid output never becomes a random move.
 
+Download the reviewed **[v0.1 release](https://github.com/elkhantar/iron-republic-agent/releases/tag/v0.1)**
+or inspect the source in this repository. The game site offers the same standalone
+runner alongside your private seat connection file.
+
 ## Quick start
 
 1. Install [Node.js](https://nodejs.org/) 22 or newer.
@@ -66,6 +70,41 @@ Never commit or share it publicly. Each seat has its own credential.
 
 ## How it chooses moves
 
+```mermaid
+sequenceDiagram
+    actor Player
+    participant Runner as Local runner
+    participant Server as Game server (MCP)
+    participant CLI as Your signed-in agent CLI
+    participant LLM as Your model provider
+
+    Player->>Runner: Start with private seat connection file
+    Runner->>Server: Authenticate and join reserved seat
+    Server-->>Runner: Rules, reference and private seat view
+    loop Until the game finishes
+        Runner->>Server: Poll current seat view
+        Server-->>Runner: State, whose turn, legal actions
+        alt Another player is acting
+            Note over Runner: Wait; no model call
+        else Your seat needs a decision
+            Runner->>CLI: Rules and seat view on stdin
+            Note over Runner,CLI: Seat token stays in the runner
+            CLI->>LLM: Request using CLI's own provider sign-in
+            LLM-->>CLI: Choose a move
+            CLI-->>Runner: JSON action ID
+            Runner->>Runner: Validate legality and save pending request
+            Runner->>Server: Submit move with seat token and request ID
+            Server-->>Runner: Accepted move or rejection
+            Note over Runner,Server: Uncertain network outcome: retry same request ID
+        end
+    end
+    Runner-->>Player: Final VP and game result
+```
+
+The game server receives your **seat token**, not your provider login. The chosen
+CLI receives the **rules and private seat view**, not the seat token, and uses its
+own normal model-provider authentication. Keep the connection file private.
+
 Each decision gets a fresh CLI invocation with the game's rules digest, session
 reference and current private seat view. The agent is told to maximize final VP,
 improve its winning position relative to rivals, and deny opponents' scoring when
@@ -81,6 +120,8 @@ the boundaries and the information sent to model providers.
 ## Reliability and limits
 
 - Same-action network retries reuse the same request ID to prevent double moves.
+- Transient polling failures retry without calling a model. Unexpected repeated
+  decisions stop instead of consuming your subscription on the same move.
 - Pending submissions are journaled under `~/.iron-republic/agents/` before being
   sent. After a crash, the same command retries the uncertain submission before
   asking for a new move. Keep the state file until recovery completes.
@@ -91,6 +132,11 @@ the boundaries and the information sent to model providers.
   1,000 decisions and 24 hours per run. Overrides: `--poll`, `--timeout`,
   `--max-decisions`, `--max-hours`, `--state`. Run `--help` for details.
 - Run only one runner per seat. Separate seats can use separate terminals.
+- Use current official CLI versions: the runner uses their current configuration
+  isolation options. If an older CLI rejects an option, update it rather than
+  removing security flags. Tool restrictions are described in [SECURITY.md](SECURITY.md).
+- OpenCode runs with external plugins disabled. Authentication requiring an
+  external provider plugin may need a supported built-in provider instead.
 - No agent, subscription or network service is guaranteed to remain available.
   This is a runner, not a hosted LLM service.
 

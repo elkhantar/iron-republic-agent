@@ -29,9 +29,9 @@ export async function findCommand(agent, { env = process.env, platform = process
 
 export function invocation(agent, { model, schemaPath, outputPath } = {}) {
   let args;
-  if (agent === 'codex') args = ['exec', '--skip-git-repo-check', '--ephemeral', '--sandbox', 'read-only', '--output-schema', schemaPath, '--output-last-message', outputPath, '-'];
-  else if (agent === 'claude') args = ['-p', '--output-format', 'json', '--tools', '', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--json-schema', JSON.stringify(SCHEMA)];
-  else if (agent === 'opencode') args = ['run', '--format', 'json'];
+  if (agent === 'codex') args = ['exec', '--skip-git-repo-check', '--ignore-user-config', '--ignore-rules', '--disable', 'shell_tool', '--ephemeral', '--sandbox', 'read-only', '--output-schema', schemaPath, '--output-last-message', outputPath, '-'];
+  else if (agent === 'claude') args = ['-p', '--safe-mode', '--settings', '{"disableAllHooks":true}', '--output-format', 'json', '--tools', '', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--json-schema', JSON.stringify(SCHEMA)];
+  else if (agent === 'opencode') args = ['run', '--pure', '--format', 'json'];
   else if (agent === 'gemini') args = ['--prompt', 'Choose the legal game move requested in stdin. Return only the JSON answer; do not use tools.', '--output-format', 'json'];
   else throw new Error(`Unknown agent: ${agent}`);
   if (model) args.push('--model', model);
@@ -46,24 +46,24 @@ function choice(text) {
 }
 
 export function parseChoice(agent, stdout, lastMessage = '') {
-  const direct = choice(lastMessage) || choice(stdout);
-  if (direct !== null) return direct;
   let envelope;
   try { envelope = JSON.parse(stdout); } catch {}
   if (envelope?.is_error || envelope?.error) throw new Error(`${agent} reported an error. Check its sign-in, model access and usage limits.`);
-  const structured = envelope?.structured_output;
-  if (structured && typeof structured.action === 'string' && Object.keys(structured).length === 1) return structured.action;
-  for (const text of [envelope?.result, envelope?.response]) {
-    if (typeof text === 'string' && choice(text) !== null) return choice(text);
-  }
   const texts = [];
   for (const line of stdout.split(/\r?\n/)) {
     try {
       const event = JSON.parse(line);
-      if (event.type === 'error' || event.type === 'turn.failed') throw new Error('Agent execution failed.');
+      if (event.type === 'error' || event.type === 'turn.failed' || event.is_error || event.error) throw new Error('Agent execution failed.');
       if (event.type === 'text' && typeof event.part?.text === 'string') texts.push(event.part.text);
       if (event.type === 'item.completed' && event.item?.type === 'agent_message') texts.push(event.item.text);
     } catch (error) { if (error.message === 'Agent execution failed.') throw error; }
+  }
+  const direct = choice(lastMessage) ?? choice(stdout);
+  if (direct !== null) return direct;
+  const structured = envelope?.structured_output;
+  if (structured && typeof structured.action === 'string' && Object.keys(structured).length === 1) return structured.action;
+  for (const text of [envelope?.result, envelope?.response]) {
+    if (typeof text === 'string' && choice(text) !== null) return choice(text);
   }
   for (const text of [...texts].reverse()) if (choice(text) !== null) return choice(text);
   if (choice(texts.join('')) !== null) return choice(texts.join(''));
@@ -87,21 +87,45 @@ ${correction ? `\nYour previous response was invalid: ${correction}. Choose an e
 export async function runProcess(command, args, { input = '', cwd, env = process.env, timeoutMs = 180000, signal } = {}) {
   if (!command || /\.(cmd|bat)$/i.test(command)) throw new Error('Use a native executable or a Node JS entry point, not a shell script on Windows.');
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { cwd, env, shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
-    let stdout = '', stderr = '', failure;
-    const stop = reason => { failure ||= reason; child.kill(); };
+    if (signal?.aborted) return reject(new Error('Runner stopped.'));
+    const child = spawn(command, args, { cwd, env, shell: false, detached: process.platform !== 'win32', windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    let stdout = '', stderr = '', failure, stopping = false, outputBytes = 0, killDeadline;
+    const stop = reason => {
+      failure ||= reason;
+      if (stopping) return;
+      stopping = true;
+      // A wrapper may already have exited while an orphan holds its pipes. OS
+      // tree termination can then fail; never let that keep our promise pending.
+      killDeadline = setTimeout(() => {
+        child.stdin.destroy(); child.stdout.destroy(); child.stderr.destroy();
+        child.unref();
+        clearTimeout(timer); signal?.removeEventListener('abort', abort);
+        reject(failure);
+      }, 1000);
+      // Kill the whole CLI tree: wrappers can leave model processes holding pipes open.
+      if (child.pid && process.platform === 'win32') {
+        const killer = spawn(path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'taskkill.exe'), ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+        killer.once('error', () => child.kill('SIGKILL'));
+        killer.once('exit', code => { if (code) child.kill('SIGKILL'); });
+        killer.unref();
+      } else if (child.pid) {
+        try { process.kill(-child.pid, 'SIGKILL'); } catch { child.kill('SIGKILL'); }
+      }
+    };
     const abort = () => stop(new Error('Runner stopped.'));
     const timer = setTimeout(() => stop(new Error('Agent timed out. No move was submitted; restart the runner to resume.')), timeoutMs);
     signal?.addEventListener('abort', abort, { once: true });
     if (signal?.aborted) abort();
-    child.stdout.on('data', data => { stdout += data; if (stdout.length > 8 * 1024 * 1024) stop(new Error('Agent output exceeded 8 MB.')); });
+    child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
+    child.stdout.on('data', data => { outputBytes += Buffer.byteLength(data); if (outputBytes > 8 * 1024 * 1024) stop(new Error('Agent output exceeded 8 MB.')); else stdout += data; });
     child.stderr.on('data', data => { stderr = (stderr + data).slice(-4000); });
     child.stdin.on('error', () => {});
     child.once('error', error => { failure = error; });
     child.once('close', code => {
-      clearTimeout(timer); signal?.removeEventListener('abort', abort);
+      clearTimeout(timer); clearTimeout(killDeadline); signal?.removeEventListener('abort', abort);
       if (failure) return reject(failure);
-      if (code !== 0) return reject(new Error(`Agent exited with code ${code}. Check its CLI login and usage limits. ${stderr.slice(-1500)}`));
+      // CLI diagnostics may echo prompts or credentials from the user's environment.
+      if (code !== 0) return reject(new Error(`Agent exited with code ${code}. Check its CLI login and usage limits.`));
       resolve({ stdout, stderr });
     });
     child.stdin.end(input);
@@ -120,27 +144,40 @@ export function mcpClient(config, { fetchImpl = fetch, signal } = {}) {
   const endpoint = validateConnection(config);
   let id = 0;
   const rpc = async (method, params, notification = false) => {
-    const response = await fetchImpl(endpoint, { method: 'POST', redirect: 'error', signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(30000)]) : AbortSignal.timeout(30000), headers: { authorization: `Bearer ${config.token}`, 'content-type': 'application/json', accept: 'application/json, text/event-stream', 'mcp-protocol-version': '2025-11-25' }, body: JSON.stringify({ jsonrpc: '2.0', ...(notification ? {} : { id: ++id }), method, params }) });
+    const requestId = notification ? undefined : ++id;
+    const response = await fetchImpl(endpoint, { method: 'POST', redirect: 'error', signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(30000)]) : AbortSignal.timeout(30000), headers: { authorization: `Bearer ${config.token}`, 'content-type': 'application/json', accept: 'application/json, text/event-stream', 'mcp-protocol-version': '2025-11-25' }, body: JSON.stringify({ jsonrpc: '2.0', ...(notification ? {} : { id: requestId }), method, params }) });
     if (!response.ok) {
       const error = new Error(`Game server returned HTTP ${response.status}${response.status === 401 ? ': check the seat token' : response.status === 404 || response.status === 410 ? ': room deleted or expired' : ''}.`);
       error.status = response.status;
       throw error;
     }
-    if (notification && response.status === 202) return;
-    const value = await response.json();
-    if (value.error) throw new Error(`MCP error: ${value.error.message}`);
+    if (notification && (response.status === 202 || response.status === 204)) return;
+    // This server uses JSON responses, not streaming SSE. Bound untrusted responses.
+    const chunks = []; let size = 0;
+    for await (const chunk of response.body || []) {
+      size += chunk.byteLength;
+      if (size > 16 * 1024 * 1024) throw new Error('Game response exceeded 16 MB.');
+      chunks.push(chunk);
+    }
+    const value = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    if (value?.jsonrpc !== '2.0' || value.id !== requestId || (!!value.error === Object.hasOwn(value, 'result'))) throw new Error('Invalid MCP response envelope.');
+    if (value.error) throw new Error('MCP request failed. No new move will be chosen.');
     return value.result;
   };
   return {
     async initialize() {
-      const result = await rpc('initialize', { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'iron-republic-local-runner', version: '1.0.0' } });
+      const result = await rpc('initialize', { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'iron-republic-local-runner', version: '0.1.1' } });
+      if (result?.protocolVersion !== '2025-11-25' || !result.capabilities?.tools) throw new Error('Unsupported MCP negotiation: expected game tools using protocol 2025-11-25.');
       await rpc('notifications/initialized', {}, true);
       return result;
     },
     async tool(name, args = {}) {
       const result = await rpc('tools/call', { name, arguments: args });
-      const value = JSON.parse(result.content.find(item => item.type === 'text').text);
-      if (result.isError) { const error = new Error(value.error || 'Game tool failed.'); error.toolError = true; throw error; }
+      const text = result?.content?.find(item => item.type === 'text')?.text;
+      if (typeof text !== 'string') throw new Error('Invalid MCP tool response.');
+      const value = JSON.parse(text);
+      if (result.isError) { const error = new Error('Game tool failed.'); error.toolError = true; error.status = result._meta?.http_status; throw error; }
+      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid game response.');
       return value;
     },
   };
@@ -149,8 +186,10 @@ export function mcpClient(config, { fetchImpl = fetch, signal } = {}) {
 export async function saveJournal(file, value) {
   await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
   const temporary = `${file}.${randomUUID()}.tmp`;
-  await writeFile(temporary, JSON.stringify(value), { mode: 0o600 });
-  await rename(temporary, file);
+  try {
+    await writeFile(temporary, JSON.stringify(value), { mode: 0o600 });
+    await rename(temporary, file);
+  } finally { await rm(temporary, { force: true }); }
 }
 
 export async function runGame(config, { client = mcpClient(config), decide, journalFile, signal, log = console.log, sleep = ms => delay(ms, undefined, { signal }), pollMs = 3000, maxDecisions = 1000, maxRuntimeMs = 24 * 3600000, maxAttempts = 3 } = {}) {
@@ -159,27 +198,43 @@ export async function runGame(config, { client = mcpClient(config), decide, jour
   let journal = {};
   if (journalFile) { try { journal = JSON.parse(await readFile(journalFile, 'utf8')); } catch (error) { if (error.code !== 'ENOENT') throw new Error('Runner state could not be read. Keep it for diagnosing an uncertain action.'); } }
   const persist = async value => { if (journalFile) await saveJournal(journalFile, value); journal = value; };
+  const connectionId = createHash('sha256').update(JSON.stringify([config.url || '', config.token || ''])).digest('hex');
+  if (!journal || typeof journal !== 'object' || Array.isArray(journal)) throw new Error('Invalid runner state file.');
+  if (journal.pending && journal.connection_id && journal.connection_id !== connectionId) throw new Error('Runner state belongs to a different seat. Choose its original connection or a separate --state file.');
+  if (journal.pending && (!Number.isInteger(journal.pending.expected_revision) || journal.pending.expected_revision < 0 || !['decision_id', 'action', 'request_id'].every(key => typeof journal.pending[key] === 'string' && journal.pending[key]))) throw new Error('Invalid pending submission in runner state.');
   const check = () => { if (signal?.aborted) throw new Error('Runner stopped.'); if (Date.now() - started > maxRuntimeMs) throw new Error('Runner time limit reached. Restart to resume.'); };
+  const retryRead = async operation => {
+    for (let attempt = 0; ; attempt++) {
+      check();
+      try { return await operation(); }
+      catch (error) {
+        if (signal?.aborted || (error.status && error.status < 500 && error.status !== 429) || (error.toolError && !error.status) || attempt >= 2) throw error;
+        await sleep(pollMs * (attempt + 1));
+      }
+    }
+  };
   const submit = async pending => {
     // Never ask the model for another move after an uncertain network result.
     for (let attempt = 0; attempt < 3; attempt++) {
+      check();
       try { await client.tool('play_action', pending); await persist({}); return; }
       catch (error) {
-        if (error.toolError) { await persist({}); return; } // Rejected: fetch fresh state.
-        if (error.status && error.status < 500) throw error;
+        if (signal?.aborted) throw error;
+        if (error.toolError && [400, 409, 422].includes(error.status)) { await persist({}); return; } // Confirmed rejection: fetch fresh state.
+        if (error.status && error.status < 500 && error.status !== 429) throw error;
         if (attempt === 2) throw new Error('Move submission is uncertain. Pending request saved; restart this runner to retry it safely.');
         await sleep(pollMs);
       }
     }
   };
-  await client.initialize();
-  await client.tool('join_game');
+  await retryRead(() => client.initialize());
   if (journal.pending) { log('Recovering the last pending submission…'); await submit(journal.pending); }
-  let decisions = 0;
+  await retryRead(() => client.tool('join_game'));
+  let decisions = 0, previousDecision;
   log('Seat joined. Waiting for the game and your decisions…');
   while (true) {
     check();
-    const state = await client.tool('get_game');
+    const state = await retryRead(() => client.tool('get_game'));
     if (state.status === 'finished' || state.terminal) {
       log(`Game finished. Your VP: ${state.scores?.[state.you] ?? '?'}. Winners: ${(state.winners || []).map(seat => seat + 1).join(', ')}.`);
       return state;
@@ -189,6 +244,8 @@ export async function runGame(config, { client = mcpClient(config), decide, jour
     const rules = { static_context: state.static_context, session_reference: state.session_reference };
     const legal = new Set((state.briefing?.legal_actions || []).map(action => action.id));
     if (!legal.size || !state.briefing?.decision_id) throw new Error('The server returned no legal decision for your active seat.');
+    const decisionKey = JSON.stringify([state.room_revision, state.briefing.decision_id]);
+    if (previousDecision === decisionKey) throw new Error('The server repeated a submitted or rejected decision. Stopping to avoid unnecessary model calls; restart to refresh.');
     let action, correction = '';
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       check();
@@ -202,8 +259,9 @@ export async function runGame(config, { client = mcpClient(config), decide, jour
     if (!legal.has(action)) throw new Error('Agent could not produce a legal move. No move submitted. Restart to resume.');
     check();
     const pending = { expected_revision: state.room_revision, decision_id: state.briefing.decision_id, action, request_id: randomUUID() };
-    await persist({ pending });
+    await persist({ connection_id: connectionId, pending });
     await submit(pending);
+    previousDecision = decisionKey;
   }
 }
 
@@ -215,6 +273,14 @@ export async function createDecisionProvider(agent, { model, command, timeoutMs 
   const schemaPath = path.join(cwd, 'move.schema.json');
   const outputPath = path.join(cwd, 'move.json');
   await writeFile(schemaPath, JSON.stringify(SCHEMA));
+  if (agent === 'gemini') {
+    // Project settings override user preferences without replacing managed system policy.
+    await mkdir(path.join(cwd, '.gemini'));
+    await writeFile(path.join(cwd, '.gemini', 'settings.json'), JSON.stringify({
+      tools: { core: [] }, hooksConfig: { enabled: false },
+      admin: { extensions: { enabled: false }, mcp: { enabled: false }, skills: { enabled: false } },
+    }));
+  }
   const env = { ...process.env };
   delete env.IR_SEAT_TOKEN; // CLI receives game data, never the seat credential.
   if (agent === 'opencode') env.OPENCODE_CONFIG_CONTENT = JSON.stringify({ permission: { '*': 'deny' }, tools: { '*': false } });
@@ -253,16 +319,22 @@ export async function main(args = process.argv.slice(2)) {
   const positive = (key, fallback) => { const value = values[key] === undefined ? fallback : Number(values[key]); if (!Number.isFinite(value) || value <= 0) throw new Error(`--${key} must be positive.`); return value; };
   const pollMs = Math.max(1000, positive('poll', 3) * 1000);
   const timeoutMs = positive('timeout', 180) * 1000;
+  const maxRuntimeMs = positive('max-hours', 24) * 3600000;
+  const maxDecisions = positive('max-decisions', 1000);
+  if (timeoutMs > 2147483647 || maxRuntimeMs > 2147483647 || pollMs > 86400000 || !Number.isInteger(maxDecisions)) throw new Error('Timeout/runtime must be at most 24.8 days, polling at most 24 hours, and --max-decisions must be an integer.');
   const journalFile = values.state || path.join(homedir(), '.iron-republic', 'agents', createHash('sha256').update(config.url + config.token).digest('hex').slice(0, 24) + '.json');
   const controller = new AbortController();
   const stop = () => controller.abort();
+  // Also interrupts an in-flight model invocation or request at the total deadline.
+  const deadline = setTimeout(stop, maxRuntimeMs);
   process.once('SIGINT', stop); process.once('SIGTERM', stop);
   let provider;
   try {
     provider = await createDecisionProvider(agent, { model: values.model || config.model, command: values['command-json'] ? JSON.parse(values['command-json']) : undefined, timeoutMs, signal: controller.signal });
     console.log(`Iron Republic · ${agent}. Keep this terminal running; Ctrl+C stops it.`);
-    await runGame(config, { client: mcpClient(config, { signal: controller.signal }), decide: provider.decide, journalFile, signal: controller.signal, pollMs, maxDecisions: positive('max-decisions', 1000), maxRuntimeMs: positive('max-hours', 24) * 3600000 });
+    await runGame(config, { client: mcpClient(config, { signal: controller.signal }), decide: provider.decide, journalFile, signal: controller.signal, pollMs, maxDecisions, maxRuntimeMs });
   } finally {
+    clearTimeout(deadline);
     await provider?.close(); process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop);
   }
 }
