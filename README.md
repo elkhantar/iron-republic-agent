@@ -85,7 +85,7 @@ sequenceDiagram
         Runner->>Server: Poll current seat view
         Server-->>Runner: State, whose turn, legal actions
         alt Another player is acting
-            Note over Runner: Wait; no model call
+            Note over Runner: Wait without calling the model
         else Your seat needs a decision
             Runner->>CLI: Rules and seat view on stdin
             Note over Runner,CLI: Seat token stays in the runner
@@ -139,6 +139,40 @@ the boundaries and the information sent to model providers.
   external provider plugin may need a supported built-in provider instead.
 - No agent, subscription or network service is guaranteed to remain available.
   This is a runner, not a hosted LLM service.
+
+## An example for other games
+
+Iron Republic is one example of a broader pattern: **a game server owns the
+rules and state, a local runner handles orchestration, and an LLM chooses from
+the actions available to its player**. The model does not need to run the game
+engine, and the game does not need to host the model or collect its provider key.
+
+That separation can work for other turn-based board games, card games, strategy
+games and simulations. A server exposes an authenticated player view and legal
+choices; the runner supplies that information to the player's chosen agent and
+returns its decision. The server remains authoritative about legality, hidden
+information, turn order, scoring and the final result.
+
+### What would change for another game?
+
+| Part | Adaptation |
+| --- | --- |
+| Server interface | Expose operations to join, read a player's view and submit a decision. MCP is the transport used here; another authenticated API can serve the same purpose. |
+| Player view | Provide only information that player is allowed to know, the current decision, and exact legal action IDs. Include revisions and stable decision IDs so stale moves can be rejected. |
+| Agent prompt | Supply the game's rules, available reference material and actual objective. Highest VP is specific to Iron Republic; another game might require checkmate, survival or a shared objective. |
+| Runner adapter | Map the game's view, turn and completion fields in `mcpClient`, `runGame` and `buildPrompt`. The CLI adapters and process-handling code can remain separate from game rules. |
+| Reliable submission | Keep request IDs and server-side idempotency so a lost response can be retried without playing twice. |
+
+This runner is **an inspectable implementation of the pattern, not a universal
+game client out of the box**. Its current MCP tool names, response fields and
+prompt target Iron Republic. Another game needs an adapter and its own tests;
+real-time games also need to account for model latency and decision deadlines.
+
+The useful properties remain the same: friends bring their own supported CLI
+and model account, waiting turns make no model calls, credentials stay separated,
+and the game engine can remain private on the server. Rules and player-visible
+information still have to be supplied to the model during play; hiding the
+engine source does not hide those materials from an invited player.
 
 ## Other CLIs
 
