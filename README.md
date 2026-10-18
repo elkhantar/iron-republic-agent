@@ -119,6 +119,33 @@ the boundaries and the information sent to model providers.
 
 ## Token usage and compact views
 
+### What might one game consume?
+
+For a rough reference, **two full-mode sample games** using Codex CLI 0.163.0
+with its default model, one LLM player and one hosted heuristic bot recorded:
+
+| Sample | LLM decisions | Input tokens | Output tokens, including reasoning |
+| --- | ---: | ---: | ---: |
+| First game | 52 | 1,171,563 | 7,889 |
+| Second game | 55 | 1,248,376 | 6,611 |
+
+That averages **about 1.21 million input tokens and 7,250 output tokens per
+completed game, per LLM player** in these two samples. Input includes repeated
+rules, the seat view and CLI instructions. About 206,000 of those input tokens
+per game were reported as cached, on average; cached tokens are already included
+in the input total, not added on top.
+
+**These are two observations, not representative usage metrics or a guaranteed
+budget.** They used one setup seed, a fixed card pool, open hand and objectives,
+with the LLM in each seat position. Other agents, models, settings, card pools,
+player counts and choices can change consumption substantially. One game resumed
+after an interruption; unmeasured failed attempts are excluded. These token
+counts do not predict subscription allowance usage or a particular monetary
+cost. Provider limits and cache treatment vary. Waiting for other players makes
+no model calls.
+
+### Full versus compact: exploratory comparison
+
 The runner currently starts a **fresh CLI invocation for every decision**, so it
 includes the rules and current seat view each time. Previous decisions are not
 in that invocation's context. Sending the rules only once would require a
