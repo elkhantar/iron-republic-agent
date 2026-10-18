@@ -117,6 +117,69 @@ does **not** contain the game engine, rules catalogue, cards, artwork, bot
 strategies, replays or any account credentials. See [SECURITY.md](SECURITY.md) for
 the boundaries and the information sent to model providers.
 
+## Token usage and compact views
+
+The runner currently starts a **fresh CLI invocation for every decision**, so it
+includes the rules and current seat view each time. Previous decisions are not
+in that invocation's context. Sending the rules only once would require a
+persistent agent conversation and tests for growing context, stale state and
+context compaction. Rules retained in a conversation still occupy context.
+[Provider caching](https://developers.openai.com/api/docs/guides/prompt-caching)
+may reuse a repeated prefix, but does not remove that text from the request.
+
+An exploratory local test on **2026-10-17–18**, using Codex CLI **0.163.0** with its
+default model, compared full views with the engine's experimental compact view.
+Compact removes repeated reference prose while retaining current state, relevant
+rules and legal choices. Both formats received the same complete rules reference.
+This experiment does not enable compact mode in the released runner.
+
+Four positions sampled from the first full-format game were presented in both
+formats, with order alternated between positions (eight fresh model calls):
+
+| Measurement across four positions | Full | Compact |
+| --- | ---: | ---: |
+| Game prompt characters | 126,471 | 118,380 |
+| CLI-reported input tokens | 89,531 | 88,292 |
+| Of those input tokens, reported as cached | 23,296 | 13,824 |
+| CLI-reported output tokens, including reasoning | 383 | 403 |
+| Mean elapsed time per decision, including CLI startup | 5.90 s | 5.95 s |
+| Engine-accepted answers | 4 / 4 | 4 / 4 |
+
+That is **6.4% fewer game prompt characters, but only 1.4% fewer total reported
+input tokens** in this small paired sample. The agent's own instructions also
+consume tokens. Input counts include cached tokens; cache hits differed between
+formats, so these numbers are **not a billing or subscription-quota estimate**.
+Some calls overlapped another game run, so timings were not isolated and do not
+establish a speed advantage. Three pairs chose the same action; one
+differed, which alone says nothing about which choice was stronger.
+
+Separately, four complete two-player games used one setup seed, a fixed heuristic
+opponent, open hand and objectives, with both LLM seat positions tested:
+
+| LLM seat | View | Final VP, LLM–bot | Decisions | Measured input tokens |
+| --- | --- | --- | ---: | ---: |
+| 1 | Full | 18–5 | 52 | 1,171,563 |
+| 1 | Compact | 11–12 | 61 | 1,359,307 |
+| 2 | Full | 22–9 | 55 | 1,248,376 |
+| 2 | Compact | 24–9 | 68 | 1,517,313 |
+
+Full won two games; compact won one. This is **too small a sample to rank their
+playing strength**. Compact used fewer input tokens per decision on average,
+but more total input tokens in these games because it made more decisions.
+Different choices lead to different game trajectories, so whole-game totals
+are descriptive, not controlled per-position comparisons. All 236 recorded game
+decisions were replayed in both formats with identical legal-action lists.
+
+One game resumed after a usage-limit interruption and a corrected private
+test-harness resume error. The two unmeasured failed attempts are excluded from
+the token totals; neither changed the saved game. This further limits comparison.
+
+The sample is exploratory: one CLI, its unpinned default model, few positions and
+no repeated sampling. Smaller readable views can reduce clutter, but this does
+not establish that compact views improve playing strength. Do not trade away
+scoring rules, ability timing, hidden-information boundaries or legal choices
+just to shorten a prompt. Raw game views and replays remain private.
+
 ## Reliability and limits
 
 - Same-action network retries reuse the same request ID to prevent double moves.
